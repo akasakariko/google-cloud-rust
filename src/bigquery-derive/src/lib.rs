@@ -14,6 +14,10 @@
 
 //! Derive macros for the Google Cloud BigQuery client.
 //!
+//! Each named field must map to a distinct BigQuery field name. The
+//! `#[bigquery(rename = "...")]` option can appear only once per named field
+//! and is not supported on the container or on tuple fields.
+//!
 //! # Compatibility
 //!
 //! `cargo-semver-checks` cannot verify this crate, and it does not see these
@@ -78,6 +82,8 @@ extern crate proc_macro;
 
 use proc_macro::TokenStream;
 use quote::quote;
+use std::collections::HashSet;
+use syn::ext::IdentExt;
 use syn::{Data, DeriveInput, Fields, parse_macro_input};
 
 /// Derives standard library [TryFrom] for converting a BigQuery `Row` into a struct.
@@ -93,63 +99,14 @@ pub fn derive_from_row(input: TokenStream) -> TokenStream {
 }
 
 fn derive_from_row_impl(input: DeriveInput) -> proc_macro2::TokenStream {
-    let name = input.ident;
-
-    let body = match input.data {
-        Data::Struct(data) => match data.fields {
-            Fields::Named(fields) if !fields.named.is_empty() => {
-                for f in &fields.named {
-                    if let Err(err) = get_field_name(f) {
-                        return err.to_compile_error();
-                    }
-                }
-                let field_initializations = fields.named.iter().map(|f| {
-                    let field_name = f.ident.as_ref().expect("named field must have identifier");
-                    let db_column_name = get_field_name(f).expect("validated above");
-                    quote! {
-                        #field_name: row.take(#db_column_name)?,
-                    }
-                });
-                quote! {
-                    Self {
-                        #( #field_initializations )*
-                    }
-                }
-            }
-            Fields::Unnamed(fields) if !fields.unnamed.is_empty() => {
-                if let Err(err) = reject_bigquery_attrs(&fields.unnamed) {
-                    return err.to_compile_error();
-                }
-                let field_initializations = (0..fields.unnamed.len()).map(|idx| {
-                    quote! {
-                        row.take(#idx)?,
-                    }
-                });
-                quote! {
-                    Self(
-                        #( #field_initializations )*
-                    )
-                }
-            }
-            _ => {
-                return syn::Error::new_spanned(
-                    name,
-                    "FromRow can only be derived for non-empty structs",
-                )
-                .to_compile_error();
-            }
-        },
-        _ => {
-            return syn::Error::new_spanned(
-                name,
-                "FromRow can only be derived for non-empty structs",
-            )
-            .to_compile_error();
-        }
+    let body = match struct_initializer(&input, "FromRow", quote!(row)) {
+        Ok(body) => body,
+        Err(err) => return err.to_compile_error(),
     };
 
     // TODO(#5592): check that the schema and this struct have same columns/attributes count.
 
+    let name = input.ident;
     let generics = add_trait_bounds(input.generics);
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
 
@@ -176,61 +133,12 @@ pub fn derive_from_sql(input: TokenStream) -> TokenStream {
 }
 
 fn derive_from_sql_impl(input: DeriveInput) -> proc_macro2::TokenStream {
-    let name = input.ident;
-
-    let body = match input.data {
-        Data::Struct(data) => match data.fields {
-            Fields::Named(fields) if !fields.named.is_empty() => {
-                for f in &fields.named {
-                    if let Err(err) = get_field_name(f) {
-                        return err.to_compile_error();
-                    }
-                }
-                let field_initializations = fields.named.iter().map(|f| {
-                    let field_name = f.ident.as_ref().expect("named field must have identifier");
-                    let db_column_name = get_field_name(f).expect("validated above");
-                    quote! {
-                        #field_name: value.take(#db_column_name)?,
-                    }
-                });
-                quote! {
-                    Self {
-                        #( #field_initializations )*
-                    }
-                }
-            }
-            Fields::Unnamed(fields) if !fields.unnamed.is_empty() => {
-                if let Err(err) = reject_bigquery_attrs(&fields.unnamed) {
-                    return err.to_compile_error();
-                }
-                let field_initializations = (0..fields.unnamed.len()).map(|idx| {
-                    quote! {
-                        value.take(#idx)?,
-                    }
-                });
-                quote! {
-                    Self(
-                        #( #field_initializations )*
-                    )
-                }
-            }
-            _ => {
-                return syn::Error::new_spanned(
-                    name,
-                    "FromSql can only be derived for non-empty structs",
-                )
-                .to_compile_error();
-            }
-        },
-        _ => {
-            return syn::Error::new_spanned(
-                name,
-                "FromSql can only be derived for non-empty structs",
-            )
-            .to_compile_error();
-        }
+    let body = match struct_initializer(&input, "FromSql", quote!(value)) {
+        Ok(body) => body,
+        Err(err) => return err.to_compile_error(),
     };
 
+    let name = input.ident;
     let generics = add_trait_bounds(input.generics);
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
 
@@ -240,6 +148,59 @@ fn derive_from_sql_impl(input: DeriveInput) -> proc_macro2::TokenStream {
                 std::result::Result::Ok(#body)
             }
         }
+    }
+}
+
+fn struct_initializer(
+    input: &DeriveInput,
+    derive_name: &str,
+    source: proc_macro2::TokenStream,
+) -> syn::Result<proc_macro2::TokenStream> {
+    if let Some(attr) = input
+        .attrs
+        .iter()
+        .find(|attr| attr.path().is_ident("bigquery"))
+    {
+        return Err(syn::Error::new_spanned(
+            attr,
+            "bigquery attributes are not supported on the container",
+        ));
+    }
+    let unsupported = || {
+        syn::Error::new_spanned(
+            &input.ident,
+            format!("{derive_name} can only be derived for non-empty structs"),
+        )
+    };
+    let Data::Struct(data) = &input.data else {
+        return Err(unsupported());
+    };
+    match &data.fields {
+        Fields::Named(fields) if !fields.named.is_empty() => {
+            let mut names = HashSet::new();
+            let mut initializers = Vec::new();
+            for field in &fields.named {
+                let ident = field
+                    .ident
+                    .as_ref()
+                    .expect("named field must have identifier");
+                let (name, span) = get_field_name(ident, &field.attrs)?;
+                if !names.insert(name.clone()) {
+                    return Err(syn::Error::new(
+                        span,
+                        format!("duplicate BigQuery field name `{name}`"),
+                    ));
+                }
+                initializers.push(quote!(#ident: #source.take(#name)?));
+            }
+            Ok(quote!(Self { #(#initializers,)* }))
+        }
+        Fields::Unnamed(fields) if !fields.unnamed.is_empty() => {
+            reject_bigquery_attrs(&fields.unnamed)?;
+            let indices = 0..fields.unnamed.len();
+            Ok(quote!(Self(#(#source.take(#indices)?,)*)))
+        }
+        _ => Err(unsupported()),
     }
 }
 
@@ -267,86 +228,33 @@ fn add_trait_bounds(mut generics: syn::Generics) -> syn::Generics {
     generics
 }
 
-fn get_field_name(field: &syn::Field) -> syn::Result<String> {
-    for attr in &field.attrs {
-        if attr.path().is_ident("bigquery") {
-            let mut renamed = None;
-            attr.parse_nested_meta(|meta| {
-                if meta.path.is_ident("rename") {
-                    let value = meta.value()?;
-                    let lit: syn::LitStr = value.parse()?;
-                    renamed = Some(lit.value());
-                    Ok(())
-                } else {
-                    Err(meta.error("unsupported bigquery attribute"))
-                }
-            })?;
-            if let Some(name) = renamed {
-                return Ok(name);
+fn get_field_name(
+    ident: &syn::Ident,
+    attrs: &[syn::Attribute],
+) -> syn::Result<(String, proc_macro2::Span)> {
+    let mut renamed: Option<syn::LitStr> = None;
+    for attr in attrs.iter().filter(|attr| attr.path().is_ident("bigquery")) {
+        attr.parse_nested_meta(|meta| {
+            if !meta.path.is_ident("rename") {
+                return Err(meta.error("unsupported bigquery attribute"));
             }
-        }
+            if renamed.is_some() {
+                return Err(meta.error("duplicate `rename` option"));
+            }
+            renamed = Some(meta.value()?.parse()?);
+            Ok(())
+        })?;
     }
-    Ok(syn::ext::IdentExt::unraw(
-        field
-            .ident
-            .as_ref()
-            .expect("named field must have identifier"),
-    )
-    .to_string())
+    Ok(match renamed {
+        Some(lit) => (lit.value(), lit.span()),
+        None => (ident.unraw().to_string(), ident.span()),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use syn::parse_quote;
     use test_case::test_case;
-
-    fn extract_first_field(input: DeriveInput) -> syn::Field {
-        match input.data {
-            Data::Struct(s) => match s.fields {
-                Fields::Named(n) => n.named.into_iter().next().unwrap(),
-                _ => unreachable!(),
-            },
-            _ => unreachable!(),
-        }
-    }
-
-    #[test]
-    fn test_invalid_bigquery_attribute_typo_errors() {
-        let make_input = || -> DeriveInput {
-            parse_quote! {
-                struct MyRow {
-                    #[bigquery(renam = "custom_col")]
-                    field: i64,
-                }
-            }
-        };
-        let field = extract_first_field(make_input());
-
-        let err = get_field_name(&field).unwrap_err();
-        assert!(
-            err.to_string().contains("unsupported bigquery attribute"),
-            "{err}"
-        );
-
-        let row_tokens = derive_from_row_impl(make_input()).to_string();
-        assert!(row_tokens.contains("unsupported bigquery attribute"));
-
-        let sql_tokens = derive_from_sql_impl(make_input()).to_string();
-        assert!(sql_tokens.contains("unsupported bigquery attribute"));
-    }
-
-    #[test]
-    fn test_invalid_bigquery_attribute_non_string_value_errors() {
-        let field = extract_first_field(parse_quote! {
-            struct MyRow {
-                #[bigquery(rename = 123)]
-                field: i64,
-            }
-        });
-
-        assert!(get_field_name(&field).is_err());
-    }
 
     #[test_case("struct Empty {}"; "empty named struct")]
     #[test_case("struct EmptyTuple();"; "empty tuple struct")]
@@ -366,20 +274,39 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_rejects_bigquery_attribute_on_tuple_struct_field() -> Result<(), syn::Error> {
-        let def = r#"struct TupleWithAttr(#[bigquery(rename = "custom")] i64);"#;
-        let row_err = derive_from_row_impl(syn::parse_str(def)?).to_string();
-        assert!(
-            row_err.contains("bigquery attributes are not supported on tuple struct fields"),
-            "unexpected expansion: {row_err}"
-        );
-
-        let sql_err = derive_from_sql_impl(syn::parse_str(def)?).to_string();
-        assert!(
-            sql_err.contains("bigquery attributes are not supported on tuple struct fields"),
-            "unexpected expansion: {sql_err}"
-        );
+    #[test_case(
+        r#"struct Row(#[bigquery(rename = "custom")] i64);"#,
+        "bigquery attributes are not supported on tuple struct fields"; "tuple field"
+    )]
+    #[test_case(
+        r#"struct Row { r#type: i64, #[bigquery(rename = "type")] other: i64 }"#,
+        "duplicate BigQuery field name `type`"; "duplicate field name"
+    )]
+    #[test_case(
+        r#"struct Row { #[bigquery(rename = "first", rename = "second")] field: i64 }"#,
+        "duplicate `rename` option"; "duplicate rename in one attribute"
+    )]
+    #[test_case(
+        r#"struct Row { #[bigquery(rename = "first")] #[bigquery(rename = "second")] field: i64 }"#,
+        "duplicate `rename` option"; "duplicate rename across attributes"
+    )]
+    #[test_case(
+        r#"struct Row { #[bigquery(rename = "valid")] #[bigquery(renam = "typo")] field: i64 }"#,
+        "unsupported bigquery attribute"; "unknown option after rename"
+    )]
+    #[test_case(
+        "struct Row { #[bigquery(rename = 123)] field: i64 }",
+        "expected string literal"; "non-string rename"
+    )]
+    #[test_case(
+        r#"#[bigquery(rename_all = "camelCase")] struct Row { field: i64 }"#,
+        "bigquery attributes are not supported on the container"; "container attribute"
+    )]
+    fn test_rejects_bigquery_attributes(def: &str, message: &str) -> syn::Result<()> {
+        for derive in [derive_from_row_impl, derive_from_sql_impl] {
+            let tokens = derive(syn::parse_str(def)?).to_string();
+            assert!(tokens.contains(message), "unexpected expansion: {tokens}");
+        }
         Ok(())
     }
 
